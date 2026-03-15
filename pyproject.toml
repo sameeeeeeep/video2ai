@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video2ai"
+version = "0.1.0"
+description = "Convert video to AI-ingestable format (frames + transcript + LLM analysis)"
+requires-python = ">=3.10"
+dependencies = [
+    "openai-whisper",
+    "Pillow",
+    "numpy",
+    "flask",
+]
+
+[project.optional-dependencies]
+vision = [
+    "pyobjc-framework-Vision",
+    "pyobjc-framework-CoreML",
+    "pyobjc-framework-Quartz",
+]
+
+[project.scripts]
+video2ai = "video2ai.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["video2ai*"]
