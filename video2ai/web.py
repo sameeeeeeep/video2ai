@@ -236,8 +236,8 @@ def apply_cluster_filter(job_id):
 
 @app.route("/result/<job_id>/run-ocr", methods=["POST"])
 def run_ocr(job_id):
-    """Run Apple Vision OCR on selected key frames. Returns OCR text per frame."""
-    from .vision import is_available as vision_available, analyze_frames
+    """Run Apple Vision OCR on selected key frames + summarize via Apple Intelligence."""
+    from .vision import is_available as vision_available, analyze_frames, summarize_ocr_text
     from .frames import ExtractedFrame
 
     state = _load_job_state(job_id)
@@ -266,19 +266,30 @@ def run_ocr(job_id):
 
     # Store OCR results in state
     ocr_data = {}
+    all_ocr_texts = []
     for a in analyses:
         ocr_data[a.frame_index] = {
             "ocr_text": a.ocr_text,
             "labels": a.labels,
         }
+        if a.ocr_text and a.ocr_text.strip():
+            all_ocr_texts.append(a.ocr_text.strip())
 
     state["ocr_results"] = ocr_data
+
+    # Summarize all OCR text using Apple Intelligence
+    ocr_summary = None
+    if all_ocr_texts:
+        ocr_summary = summarize_ocr_text(all_ocr_texts)
+    state["ocr_summary"] = ocr_summary
+
     _save_job_state(job_id, state)
 
     return jsonify(
         ok=True,
         count=len(analyses),
         results={str(k): v for k, v in ocr_data.items()},
+        summary=ocr_summary,
     )
 
 
@@ -314,6 +325,7 @@ def download_export(job_id):
     mode = request.args.get("mode", "full")
 
     if mode == "md":
+        include_raw_ocr = request.args.get("raw_ocr", "0") == "1"
         md_path = _build_export_markdown(
             job_path=job_path,
             source_name=state["source"],
@@ -321,7 +333,8 @@ def download_export(job_id):
             resolution=state.get("resolution", ""),
             key_frames=key_frames,
             transcript=state.get("transcript", []),
-            ocr_results=state.get("ocr_results"),
+            ocr_results=state.get("ocr_results") if include_raw_ocr else None,
+            ocr_summary=state.get("ocr_summary"),
         )
         return send_file(
             md_path, as_attachment=True,
@@ -604,11 +617,13 @@ def _build_export_markdown(
     key_frames: list[dict],
     transcript: list[dict],
     ocr_results: dict | None = None,
+    ocr_summary: str | None = None,
 ) -> str:
     """Build a lightweight Markdown file with local image paths — no base64 bloat.
 
     Images are referenced as relative paths to the already-extracted frames
-    sitting in the job directory.
+    sitting in the job directory. Raw OCR per frame is omitted by default —
+    only the summary is included unless ocr_results is explicitly passed.
     """
 
     def _ts(seconds):
@@ -670,6 +685,15 @@ def _build_export_markdown(
                 if ocr.get("labels"):
                     lines.append(f"> Labels: {', '.join(ocr['labels'])}")
             lines.append("")
+
+    # OCR summary (Apple Intelligence)
+    if ocr_summary:
+        lines.append("---")
+        lines.append("")
+        lines.append("## On-Screen Text Summary")
+        lines.append("")
+        lines.append(ocr_summary)
+        lines.append("")
 
     # Full transcript
     if transcript:
@@ -1627,6 +1651,7 @@ RESULT_PAGE = (
   .cluster-chip.suppressed { opacity: .35; border-style: dashed; }
   .cluster-chip.suppressed:hover { opacity: .6; }
   .cluster-chip.selected { border-color: var(--key); background: var(--key-bg); box-shadow: 2px 2px 0 var(--key); }
+  .cluster-chip.deselected { opacity: .5; border-style: dotted; }
   .cluster-chip img { width: 40px; height: 26px; object-fit: cover; display: block; border: 1px solid var(--border); }
   .cluster-chip .chip-count {
     font-size: 10px; font-weight: 700; font-family: 'Space Mono', monospace; color: var(--text2);
@@ -1692,6 +1717,7 @@ RESULT_PAGE = (
     <div class="bottom-actions">
       <a href="/" class="btn btn-outline">New Video</a>
       <button id="ocrBtn" class="btn btn-outline" style="pointer-events:none;opacity:.4" title="Run Apple Vision OCR + labels on selected key frames">Run OCR</button>
+      <label style="display:none;font-size:11px;gap:4px;align-items:center;cursor:pointer" id="rawOcrLabel"><input type="checkbox" id="rawOcrCheck"> Raw OCR</label>
       <a id="downloadBtn" class="btn btn-key" style="pointer-events:none;opacity:.4">Download HTML</a>
       <a id="downloadAiBtn" class="btn btn-outline" style="pointer-events:none;opacity:.4" title="Lightweight markdown with local image paths, optimized for AI">Download for AI</a>
     </div>
@@ -1874,6 +1900,10 @@ function updateCount() {
     btn.style.pointerEvents = 'auto';
     btn.style.opacity = '1';
     aiBtn.href = '/result/' + jobId + '/download?mode=md';
+    aiBtn.onclick = function(e) {
+      var raw = document.getElementById('rawOcrCheck').checked ? '1' : '0';
+      aiBtn.href = '/result/' + jobId + '/download?mode=md&raw_ocr=' + raw;
+    };
     aiBtn.style.pointerEvents = 'auto';
     aiBtn.style.opacity = '1';
     ocrBtn.style.pointerEvents = 'auto';
@@ -1961,7 +1991,7 @@ function buildClusterBar() {
     chip.className = 'cluster-chip' + (suppressedClusters.has(c.id) ? ' suppressed' : '');
     chip.dataset.clusterId = c.id;
     chip.dataset.state = suppressedClusters.has(c.id) ? 'suppressed' : 'default';
-    chip.title = c.size + ' frames — click: select all / right-click: suppress';
+    chip.title = c.size + ' frames — click: deselect/select / right-click: suppress';
     chip.onclick = function(e) { e.preventDefault(); cycleCluster(c.id, chip, c.frame_indices); };
     chip.oncontextmenu = function(e) { e.preventDefault(); cycleCluster(c.id, chip, c.frame_indices, true); };
 
@@ -1983,7 +2013,7 @@ function buildClusterBar() {
 }
 
 function cycleCluster(clusterId, chipEl, frameIndices, rightClick) {
-  // Left click: default → selected → default
+  // Left click: default → deselected → selected → deselected (deselect first)
   // Right click: default → suppressed → default
   var curState = chipEl.dataset.state || 'default';
   var action;
@@ -1991,7 +2021,7 @@ function cycleCluster(clusterId, chipEl, frameIndices, rightClick) {
   if (rightClick) {
     action = (curState === 'suppressed') ? 'restore' : 'suppress';
   } else {
-    action = (curState === 'selected') ? 'deselect' : 'select';
+    action = (curState === 'deselected') ? 'select' : 'deselect';
   }
 
   fetch('/result/' + jobId + '/apply-filter', {
@@ -2005,20 +2035,21 @@ function cycleCluster(clusterId, chipEl, frameIndices, rightClick) {
     selectedSet = new Set(d.key_frame_indices);
 
     // Update chip visual state
-    chipEl.classList.remove('suppressed', 'selected');
+    chipEl.classList.remove('suppressed', 'selected', 'deselected');
     if (action === 'suppress') {
       suppressedClusters.add(clusterId);
       chipEl.dataset.state = 'suppressed';
       chipEl.classList.add('suppressed');
       showToast('Suppressed — ' + d.removed + ' frames removed');
+    } else if (action === 'deselect') {
+      chipEl.dataset.state = 'deselected';
+      chipEl.classList.add('deselected');
+      showToast('Deselected — ' + d.removed + ' frames removed');
     } else if (action === 'select') {
       suppressedClusters.delete(clusterId);
       chipEl.dataset.state = 'selected';
       chipEl.classList.add('selected');
       showToast('Selected all — ' + d.added + ' frames added');
-    } else if (action === 'deselect') {
-      chipEl.dataset.state = 'default';
-      showToast('Deselected — ' + d.removed + ' frames removed');
     } else {
       suppressedClusters.delete(clusterId);
       chipEl.dataset.state = 'default';
@@ -2046,7 +2077,11 @@ document.getElementById('ocrBtn').onclick = function() {
     btn.disabled = false;
     btn.textContent = 'Run OCR';
     if (d.error) { showToast(d.error); return; }
-    showToast('OCR done \u2014 ' + d.count + ' frames analyzed');
+    var msg = 'OCR done \u2014 ' + d.count + ' frames analyzed';
+    if (d.summary) msg += ' (summary generated)';
+    showToast(msg);
+    // Show raw OCR checkbox after OCR completes
+    document.getElementById('rawOcrLabel').style.display = 'inline-flex';
   });
 };
 </script>

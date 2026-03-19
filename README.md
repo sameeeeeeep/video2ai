@@ -40,7 +40,9 @@ Video file / URL / Screen capture
   │    │
   │    └─ global ─────── k-means clustering → visual theme groups
   │
-  └─ Apple Vision OCR ── optional, on-demand text extraction from key frames
+  ├─ Apple Vision OCR ── optional, on-demand text extraction from key frames
+  │
+  └─ Apple Intelligence ── on-device OCR summary via FoundationModels (auto-launches server)
 ```
 
 **The key insight:** frame selection is a vector math problem, not an LLM problem. Embed every frame, embed (or timestamp-match) every transcript segment, pick the frames with the highest visual distinctiveness per segment. Runs in seconds, not minutes.
@@ -89,9 +91,9 @@ The skill runs the full pipeline and outputs a lightweight Markdown file that Cl
 1. **Upload, paste URL, or screen capture** — any input mode
 2. **Pipeline runs** — probe → extract → transcribe → embed → suggest
 3. **Review** — transcript sidebar, frame grid per segment, pre-selected key frames
-4. **Filter by visual theme** — click to select all frames in a theme, right-click to suppress
-5. **OCR (optional)** — run Apple Vision OCR on selected key frames
-6. **Export** — Markdown (for AI) or HTML (for humans)
+4. **Filter by visual theme** — click to deselect/select all frames in a theme, right-click to suppress
+5. **OCR (optional)** — run Apple Vision OCR on selected key frames, auto-summarized by Apple Intelligence on-device
+6. **Export** — Markdown (for AI) or HTML (for humans). OCR summary included by default, raw OCR opt-in.
 
 ## Export Formats
 
@@ -109,7 +111,7 @@ The skill runs the full pipeline and outputs a lightweight Markdown file that Cl
 | `frames.py` | ffmpeg frame extraction at configurable intervals |
 | `transcribe.py` | Whisper speech-to-text, returns timed segments |
 | `clip_match.py` | Apple Vision embeddings, visual change detection, k-means clustering |
-| `vision.py` | Apple Vision OCR + image classification |
+| `vision.py` | Apple Vision OCR + image classification + Apple Intelligence summarization |
 | `llm.py` | Ollama LLM analysis — optional, for summaries |
 | `web.py` | Flask web UI — upload, URL, screen capture, review, export |
 | `embed.py` | Bake metadata into video via ffmpeg |
@@ -121,6 +123,7 @@ The skill runs the full pipeline and outputs a lightweight Markdown file that Cl
 - **ffmpeg** — frame extraction + audio extraction
 - **Whisper** — transcription (runs locally, `base` model is fine)
 - **yt-dlp** — optional, for URL downloads
+- **[Apple On-Device OpenAI](https://github.com/gety-ai/apple-on-device-openai)** — optional, for OCR summarization via Apple Intelligence (auto-launched when needed)
 
 ## Why Not Just Use CLIP?
 

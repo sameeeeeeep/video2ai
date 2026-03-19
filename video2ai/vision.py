@@ -1,4 +1,5 @@
 """Apple Vision framework integration for OCR and image analysis on macOS."""
+from __future__ import annotations
 
 import os
 import platform
@@ -125,3 +126,48 @@ def _classify_image(image_path: str, Vision, NSURL, CIImage) -> list[str]:
         return labels[:5]  # top 5
     except Exception:
         return []
+
+
+def summarize_ocr_text(ocr_texts: list[str]) -> str | None:
+    """Summarize OCR text from multiple frames using Apple Intelligence on-device model."""
+    combined = "\n".join(t.strip() for t in ocr_texts if t.strip())
+    if not combined:
+        return None
+
+    import urllib.request
+    import json
+
+    # Ensure the local Apple Intelligence server is running
+    try:
+        urllib.request.urlopen("http://127.0.0.1:11535/health", timeout=2)
+    except Exception:
+        import subprocess
+        subprocess.Popen(["open", "/Applications/AppleOnDeviceOpenAI-v1.1.3.app"])
+        import time
+        for _ in range(10):
+            time.sleep(1)
+            try:
+                urllib.request.urlopen("http://127.0.0.1:11535/health", timeout=2)
+                break
+            except Exception:
+                pass
+
+    try:
+        body = json.dumps({
+            "model": "apple-on-device",
+            "messages": [{"role": "user", "content":
+                "Summarize the following text extracted via OCR from video frames "
+                "into a concise, coherent summary. Focus on key information, "
+                "ignore OCR artifacts:\n\n" + combined[:4000]
+            }],
+        }).encode()
+        req = urllib.request.Request(
+            "http://127.0.0.1:11535/v1/chat/completions",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+            return data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return None
