@@ -8,6 +8,11 @@ Creates a copy of the original video with:
 
 import json
 import os
+
+
+def _ffmpeg_bin() -> str:
+    from .probe import FFMPEG
+    return FFMPEG
 import subprocess
 import tempfile
 
@@ -203,7 +208,7 @@ def _mux_video(
 ) -> bool:
     """Mux original video + chapters + subtitle track + metadata into new file."""
     cmd = [
-        "ffmpeg",
+        _ffmpeg_bin(),
         "-i", input_path,
         "-i", chapters_path,
         "-i", subs_path,

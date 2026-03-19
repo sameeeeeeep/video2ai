@@ -5,6 +5,11 @@ import subprocess
 from dataclasses import dataclass
 
 
+def _ffmpeg_bin() -> str:
+    from .probe import FFMPEG
+    return FFMPEG
+
+
 @dataclass
 class ExtractedFrame:
     index: int
@@ -77,7 +82,7 @@ def _ffmpeg_grab(
     """Use ffmpeg to extract a single frame."""
     scale = f"scale='min({max_width},iw):-2'"
     cmd = [
-        "ffmpeg",
+        _ffmpeg_bin(),
         "-ss", str(timestamp),
         "-i", video_path,
         "-vframes", "1",

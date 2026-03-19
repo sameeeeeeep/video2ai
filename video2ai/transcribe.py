@@ -6,6 +6,11 @@ import tempfile
 from dataclasses import dataclass
 
 
+def _ffmpeg_bin() -> str:
+    from .probe import FFMPEG
+    return FFMPEG
+
+
 @dataclass
 class Segment:
     start: float
@@ -24,7 +29,7 @@ def transcribe(
 
     try:
         cmd = [
-            "ffmpeg",
+            _ffmpeg_bin(),
             "-i", video_path,
             "-vn",  # no video
             "-acodec", "pcm_s16le",

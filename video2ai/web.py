@@ -21,6 +21,12 @@ from .transcribe import Segment, transcribe
 
 app = Flask(__name__)
 
+# Ensure ffmpeg is findable even when launched from restricted environments
+# (e.g. Claude Preview, launchd, etc.) where /opt/homebrew/bin isn't on PATH.
+for _bin_dir in ("/opt/homebrew/bin", "/usr/local/bin"):
+    if os.path.isdir(_bin_dir) and _bin_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _bin_dir + ":" + os.environ.get("PATH", "")
+
 JOBS_DIR = os.path.expanduser("~/.video2ai_jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
 
@@ -185,7 +191,7 @@ def apply_cluster_filter(job_id):
 
     data = request.get_json()
     cluster_id = data.get("cluster_id")
-    action = data.get("action", "suppress")  # "suppress" or "restore"
+    action = data.get("action", "suppress")  # "suppress", "restore", "select", "deselect"
 
     if cluster_id is None:
         return jsonify(error="No cluster_id"), 400
@@ -197,26 +203,82 @@ def apply_cluster_filter(job_id):
             cluster_frame_indices = set(c["frame_indices"])
             break
 
+    key_set = set(state.get("key_frame_indices", []))
+    added = 0
+
     if action == "suppress":
         suppressed.add(cluster_id)
-        # Remove cluster's frames from key frames
-        key_set = set(state.get("key_frame_indices", []))
         key_set -= cluster_frame_indices
-        state["key_frame_indices"] = sorted(key_set)
-    else:
+    elif action == "select":
         suppressed.discard(cluster_id)
-        # Don't auto-restore — user can manually add back
+        added = len(cluster_frame_indices - key_set)
+        key_set |= cluster_frame_indices
+    elif action == "deselect":
+        key_set -= cluster_frame_indices
+    else:  # restore
+        suppressed.discard(cluster_id)
 
+    state["key_frame_indices"] = sorted(key_set)
     state["suppressed_clusters"] = sorted(suppressed)
     for f in state["frames"]:
-        f["is_key_frame"] = f["index"] in set(state["key_frame_indices"])
+        f["is_key_frame"] = f["index"] in key_set
 
     _save_job_state(job_id, state)
     return jsonify(
         ok=True,
         suppressed=sorted(suppressed),
-        total_key=len(state["key_frame_indices"]),
-        removed=len(cluster_frame_indices) if action == "suppress" else 0,
+        key_frame_indices=state["key_frame_indices"],
+        total_key=len(key_set),
+        removed=len(cluster_frame_indices) if action in ("suppress", "deselect") else 0,
+        added=added,
+    )
+
+
+@app.route("/result/<job_id>/run-ocr", methods=["POST"])
+def run_ocr(job_id):
+    """Run Apple Vision OCR on selected key frames. Returns OCR text per frame."""
+    from .vision import is_available as vision_available, analyze_frames
+    from .frames import ExtractedFrame
+
+    state = _load_job_state(job_id)
+    if not state:
+        return jsonify(error="Job not found"), 404
+
+    if not vision_available():
+        return jsonify(error="Apple Vision not available. Install pyobjc-framework-Vision."), 400
+
+    job_path = _job_dir(job_id)
+    key_set = set(state.get("key_frame_indices", []))
+    key_frames = [
+        ExtractedFrame(
+            index=f["index"],
+            timestamp=f["timestamp"],
+            path=os.path.join(job_path, f["path"]),
+        )
+        for f in state["frames"]
+        if f["index"] in key_set
+    ]
+
+    if not key_frames:
+        return jsonify(error="No key frames selected"), 400
+
+    analyses = analyze_frames(key_frames, verbose=False)
+
+    # Store OCR results in state
+    ocr_data = {}
+    for a in analyses:
+        ocr_data[a.frame_index] = {
+            "ocr_text": a.ocr_text,
+            "labels": a.labels,
+        }
+
+    state["ocr_results"] = ocr_data
+    _save_job_state(job_id, state)
+
+    return jsonify(
+        ok=True,
+        count=len(analyses),
+        results={str(k): v for k, v in ocr_data.items()},
     )
 
 
@@ -233,7 +295,11 @@ def update_transcript(job_id):
 
 @app.route("/result/<job_id>/download")
 def download_export(job_id):
-    """Generate and download a self-contained HTML with key frames + transcript."""
+    """Generate and download a self-contained HTML with key frames + transcript.
+
+    ?mode=ai  → tiny thumbnails (300px, q=25), optimized for feeding to LLMs
+    ?mode=full (default) → full-res images for human review
+    """
     state = _load_job_state(job_id)
     if not state:
         return "Job not found", 404
@@ -245,6 +311,23 @@ def download_export(job_id):
     if not key_frames:
         return "No key frames selected. Go back and select some frames.", 400
 
+    mode = request.args.get("mode", "full")
+
+    if mode == "md":
+        md_path = _build_export_markdown(
+            job_path=job_path,
+            source_name=state["source"],
+            duration=state.get("duration_formatted", ""),
+            resolution=state.get("resolution", ""),
+            key_frames=key_frames,
+            transcript=state.get("transcript", []),
+            ocr_results=state.get("ocr_results"),
+        )
+        return send_file(
+            md_path, as_attachment=True,
+            download_name=f"{os.path.splitext(state['source'])[0]}_export.md",
+        )
+
     html_path = _build_export_html(
         job_path=job_path,
         source_name=state["source"],
@@ -252,11 +335,13 @@ def download_export(job_id):
         resolution=state.get("resolution", ""),
         key_frames=key_frames,
         transcript=state.get("transcript", []),
+        ai_mode=(mode == "ai"),
     )
 
+    suffix = "_ai" if mode == "ai" else "_export"
     return send_file(
         html_path, as_attachment=True,
-        download_name=f"{os.path.splitext(state['source'])[0]}_export.html",
+        download_name=f"{os.path.splitext(state['source'])[0]}{suffix}.html",
     )
 
 
@@ -312,12 +397,31 @@ def _run_url_pipeline(job_id: str, url: str, job_path: str, config: dict):
 
 def _run_pipeline(job_id: str, video_path: str, config: dict):
     """Simple pipeline: probe → extract frames → transcribe. That's it."""
+    import subprocess as _sp
+
     job_path = _job_dir(job_id)
     try:
         check_ffmpeg()
     except RuntimeError as e:
         _emit(job_id, type="error", detail=str(e))
         return
+
+    # Convert webm to mp4 — webm from MediaRecorder has no seek index or duration header,
+    # which breaks frame extraction and probe. Quick remux/transcode fixes everything.
+    if video_path.lower().endswith(".webm"):
+        from .probe import FFMPEG
+        mp4_path = video_path.rsplit(".", 1)[0] + ".mp4"
+        _emit(job_id, type="step", step="convert", status="active")
+        conv = _sp.run(
+            [FFMPEG, "-i", video_path, "-c:v", "libx264", "-preset", "ultrafast",
+             "-c:a", "aac", "-y", mp4_path],
+            capture_output=True, text=True,
+        )
+        if conv.returncode == 0 and os.path.isfile(mp4_path):
+            video_path = mp4_path
+            _emit(job_id, type="step", step="convert", status="done")
+        else:
+            _emit(job_id, type="step", step="convert", status="skipped")
 
     try:
         # 1. Probe
@@ -435,16 +539,18 @@ def _build_export_html(
     resolution: str,
     key_frames: list[dict],
     transcript: list[dict],
+    ai_mode: bool = False,
 ) -> str:
     """Build a single self-contained HTML file with base64-embedded key frame
     images alongside their transcript segments.
 
-    This is the ideal format for AI consumption: one file, structured HTML,
-    images inline next to the text that was spoken at that moment. Any AI
-    can parse it. Any browser can render it for human review.
+    ai_mode=True: tiny thumbnails (300px wide, quality=25) so the file stays
+    small enough for LLMs to ingest. ~5KB per image instead of ~40KB.
     """
     import base64
     from html import escape
+    from io import BytesIO
+    from PIL import Image
 
     def _ts(seconds):
         m, s = divmod(int(seconds), 60)
@@ -452,8 +558,19 @@ def _build_export_html(
 
     def _img_to_base64(path):
         try:
-            with open(path, "rb") as f:
-                data = base64.b64encode(f.read()).decode("ascii")
+            if ai_mode:
+                img = Image.open(path)
+                # Resize to max 300px wide, keep aspect ratio
+                max_w = 300
+                if img.width > max_w:
+                    ratio = max_w / img.width
+                    img = img.resize((max_w, int(img.height * ratio)), Image.LANCZOS)
+                buf = BytesIO()
+                img.save(buf, format="JPEG", quality=25, optimize=True)
+                data = base64.b64encode(buf.getvalue()).decode("ascii")
+            else:
+                with open(path, "rb") as f:
+                    data = base64.b64encode(f.read()).decode("ascii")
             return f"data:image/jpeg;base64,{data}"
         except Exception:
             return ""
@@ -473,6 +590,109 @@ def _build_export_html(
                 break
         if not matched:
             orphan_frames.append(frame)
+
+    return _build_segmented_export(job_path, source_name, duration, resolution,
+                                     key_frames, transcript, seg_frames, orphan_frames,
+                                     ai_mode, _img_to_base64, _ts)
+
+
+def _build_export_markdown(
+    job_path: str,
+    source_name: str,
+    duration: str,
+    resolution: str,
+    key_frames: list[dict],
+    transcript: list[dict],
+    ocr_results: dict | None = None,
+) -> str:
+    """Build a lightweight Markdown file with local image paths — no base64 bloat.
+
+    Images are referenced as relative paths to the already-extracted frames
+    sitting in the job directory.
+    """
+
+    def _ts(seconds):
+        m, s = divmod(int(seconds), 60)
+        return f"{m}:{s:02d}"
+
+    # Group key frames by transcript segment (same logic as HTML export)
+    seg_frames: dict[int, list[dict]] = {}
+    orphan_frames: list[dict] = []
+
+    for frame in key_frames:
+        ts = frame["timestamp"]
+        matched = False
+        for i, seg in enumerate(transcript):
+            if seg["start"] <= ts + 0.5 and seg["end"] >= ts - 0.5:
+                seg_frames.setdefault(i, []).append(frame)
+                matched = True
+                break
+        if not matched:
+            orphan_frames.append(frame)
+
+    lines = [
+        f"# {source_name}",
+        "",
+        f"{duration} · {resolution} · {len(key_frames)} key frames · {len(transcript)} transcript segments",
+        "",
+        "---",
+        "",
+    ]
+
+    # Segments with key frames
+    for i, seg in enumerate(transcript):
+        frames = seg_frames.get(i, [])
+        lines.append(f"### [{_ts(seg['start'])} – {_ts(seg['end'])}]")
+        lines.append("")
+        lines.append(seg["text"].strip())
+        lines.append("")
+
+        for frame in frames:
+            lines.append(f"![Frame at {_ts(frame['timestamp'])}]({frame['path']})")
+            if ocr_results and str(frame["index"]) in ocr_results:
+                ocr = ocr_results[str(frame["index"])]
+                if ocr.get("ocr_text"):
+                    lines.append(f"> OCR: {ocr['ocr_text'].strip()}")
+                if ocr.get("labels"):
+                    lines.append(f"> Labels: {', '.join(ocr['labels'])}")
+            lines.append("")
+
+    # Orphan frames
+    if orphan_frames:
+        lines.append("### Other key frames")
+        lines.append("")
+        for frame in orphan_frames:
+            lines.append(f"![Frame at {_ts(frame['timestamp'])}]({frame['path']})")
+            if ocr_results and str(frame["index"]) in ocr_results:
+                ocr = ocr_results[str(frame["index"])]
+                if ocr.get("ocr_text"):
+                    lines.append(f"> OCR: {ocr['ocr_text'].strip()}")
+                if ocr.get("labels"):
+                    lines.append(f"> Labels: {', '.join(ocr['labels'])}")
+            lines.append("")
+
+    # Full transcript
+    if transcript:
+        lines.append("---")
+        lines.append("")
+        lines.append("## Full Transcript")
+        lines.append("")
+        for seg in transcript:
+            lines.append(f"**{_ts(seg['start'])}** {seg['text'].strip()}")
+            lines.append("")
+
+    out_path = os.path.join(job_path, "export.md")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return out_path
+
+
+def _build_segmented_export(job_path, source_name, duration, resolution,
+                            key_frames, transcript, seg_frames, orphan_frames,
+                            ai_mode, _img_to_base64, _ts):
+    """Build the self-contained HTML export (original logic, extracted)."""
+    from html import escape
 
     # Build HTML
     parts = [f"""<!DOCTYPE html>
@@ -646,7 +866,7 @@ UPLOAD_PAGE = (
     letter-spacing: 1px; font-family: 'Space Mono', monospace; color: var(--text2);
     transition: all .1s;
   }
-  .tab:first-child { border-right: none; }
+  .tab:not(:last-child) { border-right: none; }
   .tab.active { background: var(--accent); color: #fff; }
   .tab:hover:not(.active) { background: var(--accent-bg); }
 
@@ -659,6 +879,31 @@ UPLOAD_PAGE = (
   .url-input input:focus { box-shadow: 4px 4px 0 var(--accent); border-color: var(--accent); transform: translate(-1px,-1px); }
   .url-input input::placeholder { color: var(--text2); }
   .url-hint { color: var(--text2); font-size: 12px; margin-top: 8px; }
+
+  .capture-panel { text-align: center; margin-bottom: 28px; }
+  .capture-preview {
+    width: 100%; aspect-ratio: 16/9; background: #111; border: var(--bw) solid var(--border);
+    box-shadow: var(--shadow); margin-bottom: 16px; display: none; object-fit: contain;
+  }
+  .capture-status {
+    font-family: 'Space Mono', monospace; font-size: 13px; color: var(--text2);
+    margin-bottom: 12px; min-height: 20px;
+  }
+  .capture-status .recording { color: var(--danger); font-weight: 700; }
+  .capture-status .count { color: var(--accent); font-weight: 700; }
+  .btn-capture {
+    display: inline-block; width: auto; padding: 14px 28px; margin: 0 6px;
+    border: var(--bw) solid var(--border); font-size: 14px; font-weight: 700;
+    cursor: pointer; transition: all .1s; letter-spacing: .5px;
+    text-transform: uppercase; box-shadow: var(--shadow); font-family: 'Space Mono', monospace;
+  }
+  .btn-capture:hover { transform: translate(-2px, -2px); box-shadow: 6px 6px 0 var(--border); }
+  .btn-capture:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--border); }
+  .btn-capture:disabled { opacity: .4; cursor: not-allowed; transform: none; }
+  .btn-start { background: var(--accent2); color: #fff; }
+  .btn-stop { background: var(--danger); color: #fff; }
+  .btn-send { background: var(--accent); color: #fff; }
+  .capture-hint { color: var(--text2); font-size: 13px; margin-top: 16px; line-height: 1.5; }
 </style>
 </head>
 <body>
@@ -670,6 +915,7 @@ UPLOAD_PAGE = (
   <div class="tab-bar">
     <button class="tab active" data-tab="upload" onclick="switchTab('upload')">Upload File</button>
     <button class="tab" data-tab="url" onclick="switchTab('url')">Paste URL</button>
+    <button class="tab" data-tab="capture" onclick="switchTab('capture')">Screen Capture</button>
   </div>
 
   <form id="form" enctype="multipart/form-data">
@@ -689,7 +935,24 @@ UPLOAD_PAGE = (
       </div>
     </div>
 
-    <div class="settings">
+    <div id="tab-capture" style="display:none">
+      <div class="capture-panel">
+        <video class="capture-preview" id="capturePreview" muted></video>
+        <div class="capture-status" id="captureStatus">Share your screen, play a video, then stop when done.</div>
+        <div>
+          <button type="button" class="btn-capture btn-start" id="startCapture">Start Capture</button>
+          <button type="button" class="btn-capture btn-stop" id="stopCapture" disabled>Stop</button>
+          <button type="button" class="btn-capture btn-send" id="sendCapture" disabled>Process Capture</button>
+        </div>
+        <p class="capture-hint">Captures your screen at 1fps + audio. Works with any video on any site.<br>
+        <strong>For audio:</strong> Share a <em>Chrome tab</em> (not window/screen) to capture system audio. Or enable mic fallback below.</p>
+        <label style="display:inline-flex;align-items:center;gap:6px;margin-top:8px;font-size:13px;cursor:pointer;">
+          <input type="checkbox" id="micFallback"> Use microphone if no system audio
+        </label>
+      </div>
+    </div>
+
+    <div id="settingsPanel" class="settings">
       <div class="field"><label>Frame interval (sec)</label><input type="number" name="interval" value="1.0" step="0.5" min="0.5"></div>
       <div class="field"><label>Max width (px)</label><input type="number" name="max_width" value="1280"></div>
       <div class="field"><label>Whisper model</label>
@@ -715,6 +978,9 @@ function switchTab(tab){
   document.querySelectorAll('.tab').forEach(function(t){t.classList.toggle('active',t.dataset.tab===tab)});
   document.getElementById('tab-upload').style.display=tab==='upload'?'':'none';
   document.getElementById('tab-url').style.display=tab==='url'?'':'none';
+  document.getElementById('tab-capture').style.display=tab==='capture'?'':'none';
+  document.getElementById('settingsPanel').style.display=tab==='capture'?'none':'';
+  document.getElementById('processBtn').style.display=tab==='capture'?'none':'';
 }
 
 dz.onclick=function(){inp.click()};
@@ -745,6 +1011,143 @@ document.getElementById('form').onsubmit=async function(e){
     var data=await res.json();
     if(data.error){alert(data.error);btn.disabled=false;btn.textContent='Process Video';return}
     window.location.href='/processing/'+data.job_id;
+  }
+};
+
+// ─── Screen Capture ──────────────────────────────────────────────────────
+var captureStream = null;
+var mediaRecorder = null;
+var recordedChunks = [];
+var captureStartTime = 0;
+var captureTimer = null;
+var statusEl = document.getElementById('captureStatus');
+
+document.getElementById('startCapture').onclick = async function() {
+  // Get screen stream with audio
+  try {
+    captureStream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: 30 } },
+      audio: true
+    });
+  } catch(e) {
+    statusEl.textContent = 'Screen sharing was denied or cancelled.';
+    return;
+  }
+
+  // Check for audio, try mic fallback if needed
+  var hasAudio = captureStream.getAudioTracks().length > 0;
+  var useMic = document.getElementById('micFallback').checked;
+  var combinedStream = captureStream;
+
+  if (!hasAudio && useMic) {
+    try {
+      var micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      combinedStream = new MediaStream([
+        ...captureStream.getVideoTracks(),
+        ...micStream.getAudioTracks()
+      ]);
+      hasAudio = true;
+      // Stop mic when screen capture ends
+      captureStream.getVideoTracks()[0].addEventListener('ended', function() {
+        micStream.getTracks().forEach(function(t) { t.stop(); });
+      });
+    } catch(e) { /* mic denied, continue without audio */ }
+  }
+
+  recordedChunks = [];
+  captureStartTime = Date.now();
+
+  // Show preview
+  var preview = document.getElementById('capturePreview');
+  preview.srcObject = captureStream;
+  preview.style.display = 'block';
+  preview.play();
+
+  // Record the stream as a single webm video
+  mediaRecorder = new MediaRecorder(combinedStream, {
+    mimeType: 'video/webm;codecs=vp8,opus'
+  });
+  mediaRecorder.ondataavailable = function(e) {
+    if (e.data.size > 0) recordedChunks.push(e.data);
+  };
+  mediaRecorder.start(1000);
+
+  // Timer display
+  captureTimer = setInterval(function() {
+    var elapsed = Math.round((Date.now() - captureStartTime) / 1000);
+    var m = Math.floor(elapsed / 60);
+    var s = elapsed % 60;
+    var timeStr = m + ':' + String(s).padStart(2, '0');
+    var audioStr = hasAudio ? ' (with audio)' : ' (no audio)';
+    var recDot = document.createElement('span');
+    recDot.className = 'recording';
+    recDot.textContent = '\u25cf REC';
+    statusEl.textContent = '';
+    statusEl.appendChild(recDot);
+    statusEl.appendChild(document.createTextNode(' ' + timeStr + audioStr));
+  }, 500);
+
+  // Handle stream ending (user clicks browser's "Stop sharing")
+  captureStream.getVideoTracks()[0].onended = function() {
+    document.getElementById('stopCapture').click();
+  };
+
+  document.getElementById('startCapture').disabled = true;
+  document.getElementById('stopCapture').disabled = false;
+  document.getElementById('sendCapture').disabled = true;
+};
+
+document.getElementById('stopCapture').onclick = function() {
+  if (captureTimer) { clearInterval(captureTimer); captureTimer = null; }
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+  if (captureStream) {
+    captureStream.getTracks().forEach(function(t) { t.stop(); });
+    captureStream = null;
+  }
+  var preview = document.getElementById('capturePreview');
+  preview.srcObject = null;
+  preview.style.display = 'none';
+
+  document.getElementById('startCapture').disabled = false;
+  document.getElementById('stopCapture').disabled = true;
+
+  var elapsed = Math.round((Date.now() - captureStartTime) / 1000);
+  var countSpan = document.createElement('span');
+  countSpan.className = 'count';
+  countSpan.textContent = elapsed + 's';
+  statusEl.textContent = '';
+  statusEl.appendChild(countSpan);
+  statusEl.appendChild(document.createTextNode(' recorded. Click Process Capture to continue.'));
+
+  if (recordedChunks.length > 0) {
+    document.getElementById('sendCapture').disabled = false;
+  }
+};
+
+document.getElementById('sendCapture').onclick = async function() {
+  var btn = document.getElementById('sendCapture');
+  btn.disabled = true;
+  btn.textContent = 'UPLOADING...';
+  statusEl.textContent = 'Uploading recording...';
+
+  var videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
+
+  var fd = new FormData();
+  fd.append('video', videoBlob, 'screen_capture.webm');
+  fd.append('interval', '1.0');
+  fd.append('max_width', '1280');
+  fd.append('whisper_model', document.querySelector('[name=whisper_model]').value);
+  fd.append('quality', '85');
+
+  try {
+    var res = await fetch('/process', { method: 'POST', body: fd });
+    var data = await res.json();
+    if (data.error) { alert(data.error); btn.disabled = false; btn.textContent = 'PROCESS CAPTURE'; return; }
+    window.location.href = '/processing/' + data.job_id;
+  } catch(e) {
+    alert('Upload failed: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'PROCESS CAPTURE';
   }
 };
 </script>
@@ -1180,7 +1583,8 @@ RESULT_PAGE = (
     background: var(--surface); border-top: var(--bw) solid var(--border);
     padding: 12px 24px; z-index: 50; flex-shrink: 0;
   }
-  .bottom-inner { display: flex; justify-content: space-between; align-items: center; }
+  .bottom-inner { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .bottom-actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .selection-info { display: flex; align-items: center; gap: 16px; }
   .selection-count {
     font-size: 15px; font-weight: 700; font-family: 'Space Mono', monospace;
@@ -1222,6 +1626,7 @@ RESULT_PAGE = (
   .cluster-chip:hover { transform: translate(-1px,-1px); box-shadow: 3px 3px 0 var(--border); }
   .cluster-chip.suppressed { opacity: .35; border-style: dashed; }
   .cluster-chip.suppressed:hover { opacity: .6; }
+  .cluster-chip.selected { border-color: var(--key); background: var(--key-bg); box-shadow: 2px 2px 0 var(--key); }
   .cluster-chip img { width: 40px; height: 26px; object-fit: cover; display: block; border: 1px solid var(--border); }
   .cluster-chip .chip-count {
     font-size: 10px; font-weight: 700; font-family: 'Space Mono', monospace; color: var(--text2);
@@ -1286,7 +1691,9 @@ RESULT_PAGE = (
     </div>
     <div class="bottom-actions">
       <a href="/" class="btn btn-outline">New Video</a>
+      <button id="ocrBtn" class="btn btn-outline" style="pointer-events:none;opacity:.4" title="Run Apple Vision OCR + labels on selected key frames">Run OCR</button>
       <a id="downloadBtn" class="btn btn-key" style="pointer-events:none;opacity:.4">Download HTML</a>
+      <a id="downloadAiBtn" class="btn btn-outline" style="pointer-events:none;opacity:.4" title="Lightweight markdown with local image paths, optimized for AI">Download for AI</a>
     </div>
   </div>
 </div>
@@ -1460,14 +1867,26 @@ function updateCount() {
   var n = selectedSet.size;
   document.getElementById('selCount').textContent = n;
   var btn = document.getElementById('downloadBtn');
+  var aiBtn = document.getElementById('downloadAiBtn');
+  var ocrBtn = document.getElementById('ocrBtn');
   if (n > 0) {
     btn.href = '/result/' + jobId + '/download';
     btn.style.pointerEvents = 'auto';
     btn.style.opacity = '1';
+    aiBtn.href = '/result/' + jobId + '/download?mode=md';
+    aiBtn.style.pointerEvents = 'auto';
+    aiBtn.style.opacity = '1';
+    ocrBtn.style.pointerEvents = 'auto';
+    ocrBtn.style.opacity = '1';
   } else {
     btn.removeAttribute('href');
     btn.style.pointerEvents = 'none';
     btn.style.opacity = '.4';
+    aiBtn.removeAttribute('href');
+    aiBtn.style.pointerEvents = 'none';
+    aiBtn.style.opacity = '.4';
+    ocrBtn.style.pointerEvents = 'none';
+    ocrBtn.style.opacity = '.4';
   }
 }
 
@@ -1541,8 +1960,10 @@ function buildClusterBar() {
     var chip = document.createElement('div');
     chip.className = 'cluster-chip' + (suppressedClusters.has(c.id) ? ' suppressed' : '');
     chip.dataset.clusterId = c.id;
-    chip.title = c.size + ' frames — click to ' + (suppressedClusters.has(c.id) ? 'restore' : 'suppress');
-    chip.onclick = function() { toggleCluster(c.id, chip); };
+    chip.dataset.state = suppressedClusters.has(c.id) ? 'suppressed' : 'default';
+    chip.title = c.size + ' frames — click: select all / right-click: suppress';
+    chip.onclick = function(e) { e.preventDefault(); cycleCluster(c.id, chip, c.frame_indices); };
+    chip.oncontextmenu = function(e) { e.preventDefault(); cycleCluster(c.id, chip, c.frame_indices, true); };
 
     // Find representative frame for thumbnail
     var repFrame = allFrames.find(function(f) { return f.index === c.representative_index; });
@@ -1561,9 +1982,17 @@ function buildClusterBar() {
   });
 }
 
-function toggleCluster(clusterId, chipEl) {
-  var isSuppressed = suppressedClusters.has(clusterId);
-  var action = isSuppressed ? 'restore' : 'suppress';
+function cycleCluster(clusterId, chipEl, frameIndices, rightClick) {
+  // Left click: default → selected → default
+  // Right click: default → suppressed → default
+  var curState = chipEl.dataset.state || 'default';
+  var action;
+
+  if (rightClick) {
+    action = (curState === 'suppressed') ? 'restore' : 'suppress';
+  } else {
+    action = (curState === 'selected') ? 'deselect' : 'select';
+  }
 
   fetch('/result/' + jobId + '/apply-filter', {
     method: 'POST',
@@ -1572,29 +2001,54 @@ function toggleCluster(clusterId, chipEl) {
   }).then(function(r) { return r.json(); }).then(function(d) {
     if (!d.ok) return;
 
+    // Update selectedSet from server response
+    selectedSet = new Set(d.key_frame_indices);
+
+    // Update chip visual state
+    chipEl.classList.remove('suppressed', 'selected');
     if (action === 'suppress') {
       suppressedClusters.add(clusterId);
+      chipEl.dataset.state = 'suppressed';
       chipEl.classList.add('suppressed');
-      // Remove suppressed frames from selectedSet
-      var cluster = clusters.find(function(c) { return c.id === clusterId; });
-      if (cluster) {
-        cluster.frame_indices.forEach(function(fi) { selectedSet.delete(fi); });
-      }
-      showToast('Suppressed theme — ' + d.removed + ' frames removed');
+      showToast('Suppressed — ' + d.removed + ' frames removed');
+    } else if (action === 'select') {
+      suppressedClusters.delete(clusterId);
+      chipEl.dataset.state = 'selected';
+      chipEl.classList.add('selected');
+      showToast('Selected all — ' + d.added + ' frames added');
+    } else if (action === 'deselect') {
+      chipEl.dataset.state = 'default';
+      showToast('Deselected — ' + d.removed + ' frames removed');
     } else {
       suppressedClusters.delete(clusterId);
-      chipEl.classList.remove('suppressed');
+      chipEl.dataset.state = 'default';
       showToast('Restored theme');
     }
 
-    chipEl.title = (suppressedClusters.has(clusterId) ? 'Click to restore' : 'Click to suppress');
     updateCount();
     updateSegmentIndicators();
     updateProgressDots();
-    // Refresh current segment view to update frame selections
     if (activeSegIdx >= 0) activateSegment(activeSegIdx);
   });
 }
+
+// ─── OCR ──────────────────────────────────────────────────────────────────
+document.getElementById('ocrBtn').onclick = function() {
+  var btn = document.getElementById('ocrBtn');
+  btn.disabled = true;
+  btn.textContent = 'Running OCR...';
+
+  fetch('/result/' + jobId + '/run-ocr', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: '{}'
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    btn.disabled = false;
+    btn.textContent = 'Run OCR';
+    if (d.error) { showToast(d.error); return; }
+    showToast('OCR done \u2014 ' + d.count + ' frames analyzed');
+  });
+};
 </script>
 </body></html>"""
 )
