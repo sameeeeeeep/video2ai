@@ -9,8 +9,10 @@ No LLM, no vision framework, no scoring algorithms. Just a clean manual workflow
 import json
 import os
 import queue
+import shutil
 import threading
 import uuid
+import zipfile
 
 from flask import Flask, Response, jsonify, render_template_string, request, send_file
 
@@ -336,9 +338,21 @@ def download_export(job_id):
             ocr_results=state.get("ocr_results") if include_raw_ocr else None,
             ocr_summary=state.get("ocr_summary"),
         )
+        # Bundle markdown + frame images into a zip
+        base_name = os.path.splitext(state["source"])[0]
+        zip_path = os.path.join(job_path, "export_ai.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(md_path, f"{base_name}_export/{base_name}_export.md")
+            for frame in key_frames:
+                frame_abs = frame["path"]
+                if not os.path.isabs(frame_abs):
+                    frame_abs = os.path.join(job_path, frame_abs)
+                if os.path.exists(frame_abs):
+                    fname = os.path.basename(frame_abs)
+                    zf.write(frame_abs, f"{base_name}_export/frames/{fname}")
         return send_file(
-            md_path, as_attachment=True,
-            download_name=f"{os.path.splitext(state['source'])[0]}_export.md",
+            zip_path, as_attachment=True,
+            download_name=f"{base_name}_export.zip",
         )
 
     html_path = _build_export_html(
@@ -663,7 +677,8 @@ def _build_export_markdown(
         lines.append("")
 
         for frame in frames:
-            lines.append(f"![Frame at {_ts(frame['timestamp'])}]({frame['path']})")
+            fname = os.path.basename(frame["path"])
+            lines.append(f"![Frame at {_ts(frame['timestamp'])}](frames/{fname})")
             if ocr_results and str(frame["index"]) in ocr_results:
                 ocr = ocr_results[str(frame["index"])]
                 if ocr.get("ocr_text"):
@@ -677,7 +692,8 @@ def _build_export_markdown(
         lines.append("### Other key frames")
         lines.append("")
         for frame in orphan_frames:
-            lines.append(f"![Frame at {_ts(frame['timestamp'])}]({frame['path']})")
+            fname = os.path.basename(frame["path"])
+            lines.append(f"![Frame at {_ts(frame['timestamp'])}](frames/{fname})")
             if ocr_results and str(frame["index"]) in ocr_results:
                 ocr = ocr_results[str(frame["index"])]
                 if ocr.get("ocr_text"):
