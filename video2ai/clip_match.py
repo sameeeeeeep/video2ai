@@ -50,7 +50,8 @@ def suggest_key_frames(
     Always works — transcript is optional.  Steps:
     1. Embed every frame via VNGenerateImageFeaturePrintRequest (Neural Engine)
     2. If transcript segments exist: per-segment visual analysis
-    3. If no transcript: global visual state detection
+    3. If no transcript: detect visual states, generate synthetic segments,
+       then run per-segment matching so frames stay grouped for the UI
     """
     if not frames:
         return []
@@ -72,8 +73,8 @@ def suggest_key_frames(
         print(f"  Matching frames to {len(segments)} transcript segments...")
         suggestions = _match_per_segment(frames, embeddings, segments, top_k)
     else:
-        print("  No transcript — detecting visual states globally...")
-        suggestions = _detect_global_states(frames, embeddings)
+        print("  No transcript — detecting visual states and generating segments...")
+        suggestions = _detect_global_states(frames, embeddings, top_k)
 
     print(f"  Suggested {len(suggestions)} key frames")
 
@@ -175,8 +176,14 @@ def _match_per_segment(
 def _detect_global_states(
     frames: list[ExtractedFrame],
     embeddings: list[list[float]],
+    top_k: int = 3,
 ) -> list[FrameSuggestion]:
-    """Detect visual state changes globally when no transcript exists."""
+    """Detect visual state changes globally when no transcript exists.
+
+    Creates synthetic segments from visual state boundaries, then runs
+    per-segment matching so the UI can still group frames by section.
+    Keeps up to top_k frames per state (not just 1).
+    """
     # Compute consecutive cosine distances
     distances = []
     for i in range(len(embeddings) - 1):
@@ -194,32 +201,35 @@ def _detect_global_states(
         if start < end:
             states.append((start, end))
 
-    # Pick the most representative frame per state (closest to centroid)
-    suggestions = []
-    for state_idx, (start, end) in enumerate(states):
-        state_embeddings = embeddings[start:end]
-        centroid = [0.0] * len(state_embeddings[0])
-        for emb in state_embeddings:
-            for j in range(len(centroid)):
-                centroid[j] += emb[j]
-        n = len(state_embeddings)
-        centroid = [c / n for c in centroid]
+    # If too few states detected (e.g. scrolling a website = gradual change),
+    # create time-based segments instead (~10 seconds each)
+    if len(states) <= 2 and len(frames) > 10:
+        duration = frames[-1].timestamp - frames[0].timestamp
+        interval = 10.0  # seconds per synthetic segment
+        n_segs = max(3, int(duration / interval))
+        seg_len = len(frames) / n_segs
+        states = []
+        for i in range(n_segs):
+            start = int(i * seg_len)
+            end = int((i + 1) * seg_len)
+            if i == n_segs - 1:
+                end = len(frames)
+            if start < end:
+                states.append((start, end))
 
-        best_i = start
-        best_dist = float("inf")
-        for i in range(start, end):
-            d = _cosine_distance(embeddings[i], centroid)
-            if d < best_dist:
-                best_dist = d
-                best_i = i
-
-        f = frames[best_i]
-        suggestions.append(FrameSuggestion(
-            frame_index=f.index, timestamp=f.timestamp,
-            score=1.0 - best_dist, segment_index=state_idx,
+    # Create synthetic transcript segments from states so _match_per_segment works
+    synthetic_segments = []
+    for start, end in states:
+        seg_start = frames[start].timestamp
+        seg_end = frames[min(end - 1, len(frames) - 1)].timestamp
+        synthetic_segments.append(Segment(
+            start=seg_start,
+            end=seg_end,
+            text="",
         ))
 
-    return suggestions
+    # Reuse per-segment matching for consistent behavior
+    return _match_per_segment(frames, embeddings, synthetic_segments, top_k)
 
 
 # ── Apple Vision embedding ────────────────────────────────────────────────────

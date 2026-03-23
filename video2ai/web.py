@@ -559,6 +559,30 @@ def _run_pipeline(job_id: str, video_path: str, config: dict):
 # ─── Export: Self-contained HTML with embedded images ─────────────────────────
 
 
+def _synthesize_segments_from_frames(key_frames: list[dict], interval: float = 10.0) -> list[dict]:
+    """Generate time-based segments from key frames when no transcript exists.
+
+    Groups frames into ~interval-second windows so the export can still
+    show structured time sections instead of dumping everything as orphans.
+    """
+    if not key_frames:
+        return []
+    timestamps = sorted(f["timestamp"] for f in key_frames)
+    start_ts = timestamps[0]
+    end_ts = timestamps[-1]
+    duration = end_ts - start_ts
+    if duration <= 0:
+        return [{"start": start_ts, "end": end_ts + 1.0, "text": ""}]
+
+    segments = []
+    t = start_ts
+    while t < end_ts:
+        seg_end = min(t + interval, end_ts + 0.5)
+        segments.append({"start": t, "end": seg_end, "text": ""})
+        t += interval
+    return segments
+
+
 def _build_export_html(
     job_path: str,
     source_name: str,
@@ -602,15 +626,17 @@ def _build_export_html(
         except Exception:
             return ""
 
-    # Group key frames by which transcript segment they belong to
-    # Each segment gets the key frames that fall within its time range
+    # If no transcript, generate synthetic time-based segments
+    effective_transcript = transcript if transcript else _synthesize_segments_from_frames(key_frames)
+
+    # Group key frames by which segment they belong to
     seg_frames = {}  # seg_index -> [frame, ...]
     orphan_frames = []  # frames with no matching segment
 
     for frame in key_frames:
         ts = frame["timestamp"]
         matched = False
-        for i, seg in enumerate(transcript):
+        for i, seg in enumerate(effective_transcript):
             if seg["start"] <= ts + 0.5 and seg["end"] >= ts - 0.5:
                 seg_frames.setdefault(i, []).append(frame)
                 matched = True
@@ -619,7 +645,7 @@ def _build_export_html(
             orphan_frames.append(frame)
 
     return _build_segmented_export(job_path, source_name, duration, resolution,
-                                     key_frames, transcript, seg_frames, orphan_frames,
+                                     key_frames, effective_transcript, seg_frames, orphan_frames,
                                      ai_mode, _img_to_base64, _ts)
 
 
@@ -644,14 +670,17 @@ def _build_export_markdown(
         m, s = divmod(int(seconds), 60)
         return f"{m}:{s:02d}"
 
-    # Group key frames by transcript segment (same logic as HTML export)
+    # If no transcript, generate synthetic time-based segments
+    effective_transcript = transcript if transcript else _synthesize_segments_from_frames(key_frames)
+
+    # Group key frames by segment
     seg_frames: dict[int, list[dict]] = {}
     orphan_frames: list[dict] = []
 
     for frame in key_frames:
         ts = frame["timestamp"]
         matched = False
-        for i, seg in enumerate(transcript):
+        for i, seg in enumerate(effective_transcript):
             if seg["start"] <= ts + 0.5 and seg["end"] >= ts - 0.5:
                 seg_frames.setdefault(i, []).append(frame)
                 matched = True
@@ -662,19 +691,20 @@ def _build_export_markdown(
     lines = [
         f"# {source_name}",
         "",
-        f"{duration} · {resolution} · {len(key_frames)} key frames · {len(transcript)} transcript segments",
+        f"{duration} · {resolution} · {len(key_frames)} key frames · {len(effective_transcript)} sections",
         "",
         "---",
         "",
     ]
 
     # Segments with key frames
-    for i, seg in enumerate(transcript):
+    for i, seg in enumerate(effective_transcript):
         frames = seg_frames.get(i, [])
         lines.append(f"### [{_ts(seg['start'])} – {_ts(seg['end'])}]")
         lines.append("")
-        lines.append(seg["text"].strip())
-        lines.append("")
+        if seg["text"].strip():
+            lines.append(seg["text"].strip())
+            lines.append("")
 
         for frame in frames:
             fname = os.path.basename(frame["path"])
